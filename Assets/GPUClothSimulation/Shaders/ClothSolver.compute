@@ -1,0 +1,163 @@
+#include "./PositionBasedDynamics.cginc"
+
+#define THREADS [numthreads(512, 1, 1)]
+
+#pragma kernel SolveExternalForce
+THREADS
+void SolveExternalForce(uint3 id: SV_DispatchThreadID)
+{
+  uint idx = id.x;
+  if (idx > totalVerts) return;
+
+  float3 p = predictedPos[idx];
+  float3 v = velocity[idx];
+  float w = invMass[idx];
+  float m = mass[idx];
+
+  float3 force = gravity * m;
+
+  float3 corr;
+  if (ExternalForce(
+    deltaT,
+    p, v, w,
+    force,
+    damping,
+    corr))
+  {
+    predictedPos[idx] += corr;
+  }
+}
+
+#pragma kernel SolveDistanceConstraint
+THREADS
+void SolveDistanceConstraint(uint3 id: SV_DispatchThreadID)
+{
+  uint idx = id.x;
+  if (idx*3 + 2 > totalTriangles) return;
+
+  int t0 = tri[idx*3];
+  int t1 = tri[idx*3 + 1];
+  int t2 = tri[idx*3 + 2];
+}
+
+
+#pragma kernel SolveWindForce
+THREADS
+void SolveWindForce(uint3 id: SV_DispatchThreadID)
+{
+  uint idx = id.x;
+  if (idx*2 + 1 > totalEdges) return;
+
+  int e0 = edge[idx*2];
+  int e1 = edge[idx*2 + 1];
+  float r = restLength[idx];
+
+  float3 p0 = predictedPos[e0];
+  float3 p1 = predictedPos[e1];
+  float w0 = invMass[e0];
+  float w1 = invMass[e1];
+
+  float3 corr0;
+  float3 corr1;
+  if (DistanceConstraint(
+    p0, w0,
+    p1, w1,
+    r,
+    stretchStiffness,
+    compressionStiffness,
+    corr0, corr1))
+  {
+    // particles[e0].predictedPos += corr0;
+    // particles[e1].predictedPos += corr1;
+    AtomicAddDelta(e0, corr0.x, 0);
+    AtomicAddDelta(e0, corr0.y, 1);
+    AtomicAddDelta(e0, corr0.z, 2);
+
+    AtomicAddDelta(e1, corr1.x, 0);
+    AtomicAddDelta(e1, corr1.y, 1);
+    AtomicAddDelta(e1, corr1.z, 2);
+
+    InterlockedAdd(deltaCount[e0], 1);
+    InterlockedAdd(deltaCount[e1], 1);
+  }
+}
+
+#pragma kernel SolveDihedralConstraint
+THREADS
+void SolveDihedralConstraint(uint3 id: SV_DispatchThreadID)
+{
+  uint idx = id.x;
+  if (idx*4 + 3 > totalNeighborTriangles) return;
+
+  int t0 = neighborTriangle[idx*4];
+  int t1 = neighborTriangle[idx*4 + 1];
+  int t2 = neighborTriangle[idx*4 + 2];
+  int t3 = neighborTriangle[idx*4 + 3];
+  float r = restAngle[idx];
+
+  float3 p0 = predictedPos[t0];
+  float3 p1 = predictedPos[t1];
+  float3 p2 = predictedPos[t2];
+  float3 p3 = predictedPos[t3];
+  float w0 = invMass[t0];
+  float w1 = invMass[t1];
+  float w2 = invMass[t2];
+  float w3 = invMass[t3];
+
+  float3 corr0;
+  float3 corr1;
+  float3 corr2;
+  float3 corr3;
+  if (DihedralConstraint(
+    p0, w0,
+    p1, w1,
+    p2, w2,
+    p3, w3,
+    r,
+    bendingStiffness,
+    corr0, corr1, corr2, corr3))
+  {
+    AtomicAddDelta(t0, corr0.x, 0);
+    AtomicAddDelta(t0, corr0.y, 1);
+    AtomicAddDelta(t0, corr0.z, 2);
+
+    AtomicAddDelta(t1, corr1.x, 0);
+    AtomicAddDelta(t1, corr1.y, 1);
+    AtomicAddDelta(t1, corr1.z, 2);
+
+    AtomicAddDelta(t2, corr2.x, 0);
+    AtomicAddDelta(t2, corr2.y, 1);
+    AtomicAddDelta(t2, corr2.z, 2);
+
+    AtomicAddDelta(t3, corr3.x, 0);
+    AtomicAddDelta(t3, corr3.y, 1);
+    AtomicAddDelta(t3, corr3.z, 2);
+
+    InterlockedAdd(deltaCount[t0], 1);
+    InterlockedAdd(deltaCount[t1], 1);
+    InterlockedAdd(deltaCount[t2], 1);
+    InterlockedAdd(deltaCount[t3], 1);
+  }
+}
+
+#pragma kernel AverageConstraintDeltas
+THREADS
+void AverageConstraintDeltas(uint3 id : SV_DispatchThreadID)
+{
+  uint idx = id.x;
+
+  if (deltaCount[idx] > EPSILON)
+  {
+    float3 deltaPos;
+    deltaPos.x = asfloat(deltaPosUint[idx].x);
+    deltaPos.y = asfloat(deltaPosUint[idx].y);
+    deltaPos.z = asfloat(deltaPosUint[idx].z);
+
+    deltaPos /= deltaCount[idx];
+    predictedPos[idx] += deltaPos * 1.5;
+  }
+
+  // reset delta buffers to zero
+  deltaPosUint[idx] = uint3(0, 0, 0);
+  deltaCount[idx] = 0;
+}
